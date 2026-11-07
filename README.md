@@ -12,12 +12,14 @@ dotnet publish Toki.csproj -c Release --self-contained false -o dist
 
 The published folder must be kept together. TOKI stores settings, encrypted API keys, reminders, and conversations in `%LOCALAPPDATA%\TOKI\data.json`. Keys are protected with Windows DPAPI for the current Windows user. TOKI does not make an AI request until a key is configured and a chat message is sent. Depending on your provider and account, such a request may be billed; TOKI itself does not buy credits or start a subscription.
 
+Run `dist/Toki.exe --open` to open the full workspace immediately. Launching without `--open` starts with the floating icon and tray control.
+
 ## Use
 
 - Drag the floating `T` to move it. Click to open chat; right-click for its menu.
 - Press `Ctrl+Alt+T` to open TOKI from anywhere. Change this to `Ctrl+Shift+Space` or turn it off in Settings. If another app already owns a shortcut, TOKI asks you to choose another.
 - Use the tray icon to open TOKI, create a new chat, open reminders, email, usage, or settings, pause notifications, restart, or exit.
-- Reminders: enter text, date and time, and optional daily or weekly recurrence. Due reminders display a tray notification with a sound. Snooze, mark done, or delete them from the Reminders tab.
+- Reminders: enter text, date and time, and optional daily or weekly recurrence. Due reminders display a tray notification with a sound. Snooze, mark done, or delete them from the Reminders page.
 - Chat shortcuts: `open calculator`, `open file explorer`, `open task manager`, `open downloads`, `open vs code`, `open chrome`, `take a screenshot`, `read clipboard`, `copy to clipboard <text>`, and `remind me to study at 7 pm`.
 - Settings: choose OpenAI or another OpenAI-compatible HTTPS endpoint, model, API key, startup behavior, notifications, and floating icon size. The key is encrypted locally. The model name must be supported by the configured provider. Chat responses stream when the provider supports OpenAI-compatible chat completion streaming.
 - App shortcuts: in Settings, choose an `.exe` or `.lnk` file and give it a name. Say `open <name>` in Chat to launch it. TOKI never runs a chat-generated terminal command.

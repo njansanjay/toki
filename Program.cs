@@ -12,10 +12,10 @@ namespace Toki;
 internal static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new TokiApp());
+        Application.Run(new TokiApp(args.Contains("--open", StringComparer.OrdinalIgnoreCase)));
     }
 }
 
@@ -28,7 +28,7 @@ internal sealed class TokiApp : ApplicationContext
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 15000 };
     private bool paused;
 
-    public TokiApp()
+    public TokiApp(bool openChat = false)
     {
         var oauthFile = Path.Combine(AppContext.BaseDirectory, "oauth.local.json");
         if (File.Exists(oauthFile))
@@ -66,9 +66,10 @@ internal sealed class TokiApp : ApplicationContext
         menu.Items.Add("Pause notifications", null, (_, _) => { paused = !paused; });
         menu.Items.Add("Restart TOKI", null, (_, _) => { Application.Restart(); Exit(); });
         menu.Items.Add("Exit", null, (_, _) => Exit());
-        tray = new NotifyIcon { Icon = SystemIcons.Information, Text = "TOKI", Visible = true, ContextMenuStrip = menu };
+        tray = new NotifyIcon { Icon = TokiIcon.Create(), Text = "TOKI", Visible = true, ContextMenuStrip = menu };
         tray.DoubleClick += (_, _) => Open();
         orb.Show();
+        if (openChat) Open();
         timer.Tick += (_, _) => CheckReminders();
         timer.Start();
         CheckReminders();
@@ -201,14 +202,17 @@ internal sealed class ChatForm : Form
 {
     [DllImport("user32.dll", SetLastError = true)] private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
     [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
-    private static readonly Color Canvas = Color.FromArgb(17, 20, 32);
-    private static readonly Color Surface = Color.FromArgb(27, 33, 49);
-    private static readonly Color InputSurface = Color.FromArgb(38, 45, 64);
-    private static readonly Color Accent = Color.FromArgb(115, 96, 246);
+    private static readonly Color Canvas = Color.FromArgb(13, 17, 27);
+    private static readonly Color Surface = Color.FromArgb(22, 28, 42);
+    private static readonly Color InputSurface = Color.FromArgb(32, 40, 57);
+    private static readonly Color Accent = Color.FromArgb(113, 119, 255);
+    private static readonly Color Muted = Color.FromArgb(154, 168, 190);
     private readonly TokiApp app;
-    private readonly TabControl tabs = new() { Dock = DockStyle.Fill };
-    private readonly RichTextBox history = new() { Dock = DockStyle.Fill, ReadOnly = true, BackColor = Color.FromArgb(24, 27, 38), ForeColor = Color.White, BorderStyle = BorderStyle.None, Font = new Font("Segoe UI", 10) };
-    private readonly TextBox input = new() { Dock = DockStyle.Fill, PlaceholderText = "Ask TOKI anything..." };
+    private readonly Panel pageHost = new() { Dock = DockStyle.Fill, BackColor = Canvas };
+    private readonly List<Panel> pages = new();
+    private int selectedPage;
+    private readonly FlowLayoutPanel history = new() { Dock = DockStyle.Fill, AutoScroll = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Canvas };
+    private readonly TextBox input = new() { Dock = DockStyle.Fill, Multiline = true, BorderStyle = BorderStyle.None, PlaceholderText = "Ask TOKI anything..." };
     private readonly FlowLayoutPanel reminders = new() { Dock = DockStyle.Fill, AutoScroll = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
     private readonly Label usageStatus = new() { AutoSize = true };
     private readonly Label hotkeyHint = new() { AutoSize = true, ForeColor = Color.FromArgb(159, 171, 194), Anchor = AnchorStyles.Right };
@@ -219,6 +223,7 @@ internal sealed class ChatForm : Form
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(2) };
     private readonly EmailService email;
     private ComboBox? accountBox;
+    private Label? accountEmpty;
     private readonly AccountAvatar accountAvatar = new() { Size = new Size(38, 38) };
     private readonly Label accountStatus = new() { Width = 335, Height = 42, ForeColor = Color.White, Text = "No email account connected" };
     private readonly Label connectionStatus = new() { Width = 390, Height = 42, ForeColor = Color.LightSkyBlue, Text = "Choose an account to connect." };
@@ -226,41 +231,55 @@ internal sealed class ChatForm : Form
     private Button? outlookButton;
     private Button? cancelConnectionButton;
     private CancellationTokenSource? connectionCancellation;
+    private readonly Button[] navigation = new Button[5];
+    private readonly Label sectionTitle = new() { AutoSize = true, Font = new Font("Segoe UI Semibold", 18), ForeColor = Color.White };
+    private readonly Label sectionDescription = new() { AutoSize = true, ForeColor = Muted };
+    private DateTime lastChatRefresh;
 
     public ChatForm(TokiApp app)
     {
         this.app = app;
         email = new EmailService(app);
-        Text = "TOKI  •  Desktop assistant"; Size = new Size(650, 780); MinimumSize = new Size(510, 620);
+        Text = "TOKI  ·  Desktop assistant"; Size = new Size(1080, 760); MinimumSize = new Size(780, 580);
         StartPosition = FormStartPosition.CenterScreen; TopMost = app.Data.TopMost;
-        BackColor = Canvas; ForeColor = Color.White;
+        BackColor = Canvas; ForeColor = Color.White; Icon = TokiIcon.Create();
         Font = new Font("Segoe UI", 10);
+        AutoScaleMode = AutoScaleMode.Dpi;
         FormClosing += (_, e) => { if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
-        tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
-        tabs.SizeMode = TabSizeMode.Fixed;
-        tabs.ItemSize = new Size(108, 42);
-        tabs.DrawItem += (_, e) =>
+        pages.AddRange(new[] { MakeChat(), MakeReminders(), MakePremiumEmail(), MakeUsage(), MakeSettings() });
+        foreach (var page in pages) { page.Dock = DockStyle.Fill; page.Visible = false; pageHost.Controls.Add(page); }
+        var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, BackColor = Canvas, Margin = Padding.Empty, Padding = Padding.Empty };
+        shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 212)); shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var sidebar = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(18, 24, 37), Padding = new Padding(14, 22, 14, 18) };
+        var logo = new Label { Dock = DockStyle.Top, Height = 72, Text = "◉  TOKI", Font = new Font("Segoe UI Semibold", 15), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft };
+        sidebar.Controls.Add(logo);
+        var navHost = new FlowLayoutPanel { Location = new Point(14, 106), Size = new Size(184, 308), FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = sidebar.BackColor };
+        var names = new[] { "Chat", "Reminders", "Email", "Usage", "Settings" };
+        var symbols = new[] { "✦", "◷", "✉", "◕", "⚙" };
+        for (var i = 0; i < names.Length; i++)
         {
-            var selected = e.Index == tabs.SelectedIndex;
-            using var fill = new SolidBrush(selected ? Surface : Canvas);
-            e.Graphics.FillRectangle(fill, e.Bounds);
-            TextRenderer.DrawText(e.Graphics, tabs.TabPages[e.Index].Text, Font, e.Bounds,
-                selected ? Color.White : Color.FromArgb(157, 168, 190), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            if (selected)
-            {
-                using var accent = new SolidBrush(Accent);
-                e.Graphics.FillRectangle(accent, e.Bounds.Left + 15, e.Bounds.Bottom - 3, e.Bounds.Width - 30, 3);
-            }
-        };
-        Controls.Add(tabs);
-        tabs.TabPages.Add(MakeChat()); tabs.TabPages.Add(MakeReminders()); tabs.TabPages.Add(MakePremiumEmail()); tabs.TabPages.Add(MakeUsage()); tabs.TabPages.Add(MakeSettings());
-        var header = new TableLayoutPanel { Dock = DockStyle.Top, Height = 80, ColumnCount = 2, BackColor = Canvas, Padding = new Padding(22, 12, 22, 8) };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        header.Controls.Add(new Label { Text = "✦  TOKI\n     Your desktop companion", AutoSize = true, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White }, 0, 0);
+            var index = i;
+            var nav = new Button { Text = $"  {symbols[i]}     {names[i]}", Width = 180, Height = 48, FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleLeft, Font = new Font("Segoe UI Semibold", 10), Cursor = Cursors.Hand, Margin = new Padding(0, 0, 0, 7) };
+            nav.FlatAppearance.BorderSize = 0;
+            nav.Click += (_, _) => SelectTab(index);
+            navigation[i] = nav; navHost.Controls.Add(nav);
+        }
+        sidebar.Controls.Add(navHost);
+        var footer = new Panel { Dock = DockStyle.Bottom, Height = 92, BackColor = sidebar.BackColor };
+        footer.Controls.Add(new Label { Dock = DockStyle.Top, Height = 34, Text = "●  Ready to help", ForeColor = Color.FromArgb(116, 218, 171), TextAlign = ContentAlignment.MiddleLeft });
         hotkeyHint.Text = app.Data.OpenHotkey == "Off" ? "Ready when you are" : app.Data.OpenHotkey + "  to open";
-        header.Controls.Add(hotkeyHint, 1, 0);
-        Controls.Add(header);
+        hotkeyHint.Dock = DockStyle.Bottom; hotkeyHint.Height = 32; hotkeyHint.TextAlign = ContentAlignment.MiddleLeft;
+        footer.Controls.Add(hotkeyHint); sidebar.Controls.Add(footer);
+        var workspace = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, BackColor = Canvas, Padding = new Padding(20, 16, 20, 16) };
+        workspace.RowStyles.Add(new RowStyle(SizeType.Absolute, 88)); workspace.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var heading = new Panel { Dock = DockStyle.Fill, BackColor = Canvas };
+        sectionTitle.Location = new Point(4, 7); sectionDescription.Location = new Point(5, 46);
+        heading.Controls.Add(sectionTitle); heading.Controls.Add(sectionDescription);
+        workspace.Controls.Add(heading, 0, 0); workspace.Controls.Add(pageHost, 0, 1);
+        shell.Controls.Add(sidebar, 0, 0); shell.Controls.Add(workspace, 1, 0); Controls.Add(shell);
         ApplyTheme(this);
+        SelectTab(0);
         RefreshChat(); RefreshReminders(); RefreshUsage();
     }
     protected override void OnHandleCreated(EventArgs e)
@@ -276,39 +295,81 @@ internal sealed class ChatForm : Form
             {
                 case TextBox box: box.BackColor = InputSurface; box.ForeColor = Color.White; box.BorderStyle = BorderStyle.FixedSingle; break;
                 case RichTextBox box: box.BackColor = Surface; box.ForeColor = Color.White; break;
-                case ComboBox box: box.BackColor = InputSurface; box.ForeColor = Color.White; box.FlatStyle = FlatStyle.Flat; break;
+                case ComboBox box:
+                    box.BackColor = InputSurface; box.ForeColor = Color.White; box.FlatStyle = FlatStyle.Flat;
+                    box.DrawMode = DrawMode.OwnerDrawFixed; box.ItemHeight = 25;
+                    box.DrawItem += (_, e) =>
+                    {
+                        if (e.Index < 0 || e.Index >= box.Items.Count) return;
+                        using var fill = new SolidBrush((e.State & DrawItemState.Selected) != 0 ? Color.FromArgb(58, 68, 104) : InputSurface);
+                        e.Graphics.FillRectangle(fill, e.Bounds);
+                        TextRenderer.DrawText(e.Graphics, box.Items[e.Index]?.ToString() ?? "", box.Font, e.Bounds, Color.White,
+                            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                    };
+                    break;
                 case ListBox box: box.BackColor = InputSurface; box.ForeColor = Color.White; box.BorderStyle = BorderStyle.None; break;
                 case NumericUpDown number: number.BackColor = InputSurface; number.ForeColor = Color.White; break;
                 case DateTimePicker date: date.CalendarMonthBackground = InputSurface; date.CalendarForeColor = Color.White; break;
-                case TabPage page: page.BackColor = Canvas; page.ForeColor = Color.White; break;
             }
             ApplyTheme(control);
         }
     }
-    public void SelectTab(int index) => tabs.SelectedIndex = index;
-    private TabPage Page(string title, Control content) { var p = new TabPage(title) { BackColor = Canvas, ForeColor = ForeColor, Padding = new Padding(14) }; p.Controls.Add(content); return p; }
+    private void UpdateNavigation()
+    {
+        var descriptions = new[] { "Your space to think, write, and get things done.", "Stay on top of what matters.", "Write and send with confidence.", "A clear view of your manual usage estimate.", "Make TOKI work the way you do." };
+        var selected = selectedPage;
+        sectionTitle.Text = pages[selected].Text;
+        sectionDescription.Text = descriptions[selected];
+        for (var i = 0; i < navigation.Length; i++)
+        {
+            navigation[i].BackColor = i == selected ? Color.FromArgb(40, 48, 78) : Color.FromArgb(18, 24, 37);
+            navigation[i].ForeColor = i == selected ? Color.White : Muted;
+            navigation[i].FlatAppearance.MouseOverBackColor = Color.FromArgb(40, 48, 65);
+        }
+    }
+    public void SelectTab(int index)
+    {
+        if (index < 0 || index >= pages.Count) return;
+        if (pages.Count > 0) pages[selectedPage].Visible = false;
+        selectedPage = index; pages[index].Visible = true; pages[index].BringToFront(); UpdateNavigation();
+    }
+    private Panel Page(string title, Control content) { var p = new Panel { Text = title, BackColor = Canvas, ForeColor = ForeColor, Padding = new Padding(4) }; p.Controls.Add(content); return p; }
     private static Button Button(string text, EventHandler click)
     {
-        var b = new Button { Text = text, AutoSize = true, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(67, 59, 139), ForeColor = Color.White, Padding = new Padding(8, 5, 8, 5), Cursor = Cursors.Hand };
-        b.FlatAppearance.BorderSize = 0; b.FlatAppearance.MouseOverBackColor = Color.FromArgb(91, 79, 190);
+        var b = new Button { Text = text, AutoSize = true, FlatStyle = FlatStyle.Flat, BackColor = Accent, ForeColor = Color.White, Padding = new Padding(10, 6, 10, 6), Cursor = Cursors.Hand, Font = new Font("Segoe UI Semibold", 9.5f), Margin = new Padding(0, 0, 8, 8) };
+        b.FlatAppearance.BorderSize = 0; b.FlatAppearance.MouseOverBackColor = Color.FromArgb(135, 141, 255);
         b.Click += click; return b;
     }
-    private TabPage MakeChat()
+    private static Button SecondaryButton(string text, EventHandler click)
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46)); panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        var b = Button(text, click); b.BackColor = InputSurface; b.ForeColor = Color.FromArgb(226, 231, 241);
+        b.FlatAppearance.MouseOverBackColor = Color.FromArgb(47, 57, 79); return b;
+    }
+    private Panel MakeChat()
+    {
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, BackColor = Canvas };
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 112)); panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 49));
+        history.Margin = new Padding(4, 8, 4, 10);
+        history.Padding = new Padding(8, 8, 8, 8);
+        history.Resize += (_, _) => RefreshChat();
         panel.Controls.Add(history, 0, 0);
-        var sendRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2 };
-        sendRow.ColumnCount = 3;
-        sendRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); sendRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 55)); sendRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 75));
-        sendRow.Controls.Add(input, 0, 0); sendRow.Controls.Add(Button("🎙", (_, _) => StartVoiceTyping()), 1, 0);
-        sendRow.Controls.Add(Button("Send", async (_, _) => await Send()), 2, 0);
+        var composer = new SurfaceCard { Dock = DockStyle.Fill, Padding = new Padding(16, 13, 16, 10), Margin = new Padding(4, 0, 4, 8) };
+        var sendRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, BackColor = Surface };
+        sendRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); sendRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
+        sendRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); sendRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        input.BackColor = Surface; input.ForeColor = Color.White; input.Margin = new Padding(0, 4, 0, 2);
+        sendRow.Controls.Add(input, 0, 0); sendRow.SetColumnSpan(input, 2);
+        sendRow.Controls.Add(new Label { Text = "Enter to send  ·  Shift+Enter for a new line", Dock = DockStyle.Fill, ForeColor = Muted, Font = new Font("Segoe UI", 8.5f), TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
+        var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, BackColor = Surface };
+        var sendButton = Button("Send  ↗", async (_, _) => await Send()); sendButton.Width = 82; sendButton.Height = 34; sendButton.Padding = Padding.Empty;
+        var voiceButton = SecondaryButton("Voice", (_, _) => StartVoiceTyping()); voiceButton.Width = 75; voiceButton.Height = 34; voiceButton.Padding = Padding.Empty;
+        controls.Controls.Add(sendButton); controls.Controls.Add(voiceButton); sendRow.Controls.Add(controls, 1, 1);
+        composer.Controls.Add(sendRow);
         input.KeyDown += async (_, e) => { if (e.KeyCode == Keys.Enter && !e.Shift) { e.SuppressKeyPress = true; await Send(); } };
-        panel.Controls.Add(sendRow, 0, 1);
-        var quick = new FlowLayoutPanel { Dock = DockStyle.Fill };
-        quick.Controls.Add(Button("Reminder", (_, _) => SelectTab(1))); quick.Controls.Add(Button("Email", (_, _) => SelectTab(2)));
-        quick.Controls.Add(Button("Apps", (sender, _) => ShowAppsMenu((Control)sender!)));
-        quick.Controls.Add(Button("Usage", (_, _) => SelectTab(3))); quick.Controls.Add(Button("Settings", (_, _) => SelectTab(4)));
+        panel.Controls.Add(composer, 0, 1);
+        var quick = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = Canvas, Padding = new Padding(4, 3, 0, 0) };
+        quick.Controls.Add(SecondaryButton("+ Reminder", (_, _) => SelectTab(1))); quick.Controls.Add(SecondaryButton("✉ Email", (_, _) => SelectTab(2)));
+        quick.Controls.Add(SecondaryButton("▦ Open app", (sender, _) => ShowAppsMenu((Control)sender!)));
         panel.Controls.Add(quick, 0, 2);
         return Page("Chat", panel);
     }
@@ -334,9 +395,38 @@ internal sealed class ChatForm : Form
     }
     public void RefreshChat()
     {
-        history.Clear();
-        foreach (var m in app.Data.Messages) history.AppendText($"{(m.Role == "user" ? "You" : "TOKI")}  {m.At:g}\n{m.Content}\n\n");
-        history.SelectionStart = history.TextLength; history.ScrollToCaret();
+        if (history.IsDisposed) return;
+        history.SuspendLayout();
+        while (history.Controls.Count > 0) { var old = history.Controls[0]; history.Controls.RemoveAt(0); old.Dispose(); }
+        var rowWidth = Math.Max(330, history.ClientSize.Width - 34);
+        if (app.Data.Messages.Count == 0)
+        {
+            var welcome = new SurfaceCard { Width = Math.Min(610, rowWidth - 12), Height = 160, Padding = new Padding(22), Margin = new Padding(4, 16, 0, 0) };
+            welcome.Controls.Add(new Label { Text = "Ask TOKI anything\n\nWrite a question, set a reminder, draft an email, or open an app.\nTry “remind me to study at 7 PM” or “open Calculator”.", Dock = DockStyle.Fill, Font = new Font("Segoe UI", 11), ForeColor = Color.FromArgb(225, 232, 244) });
+            history.Controls.Add(welcome);
+        }
+        if (app.Data.Messages.Count > 60)
+            history.Controls.Add(new Label { Text = "Showing the latest 60 messages", Width = rowWidth, Height = 35, ForeColor = Muted, TextAlign = ContentAlignment.MiddleCenter });
+        foreach (var m in app.Data.Messages.TakeLast(60))
+        {
+            var user = m.Role == "user";
+            var bubbleWidth = Math.Min(650, Math.Max(280, (int)(rowWidth * .79)));
+            var bodyWidth = bubbleWidth - 32;
+            var bodyHeight = TextRenderer.MeasureText(m.Content, Font, new Size(bodyWidth, 10000), TextFormatFlags.WordBreak).Height + 7;
+            var bubbleHeight = Math.Max(76, Math.Min(1000, bodyHeight + 52));
+            var row = new Panel { Width = rowWidth, Height = bubbleHeight + 11, BackColor = Canvas, Margin = new Padding(0, 0, 0, 2) };
+            var bubble = new SurfaceCard { Width = bubbleWidth, Height = bubbleHeight, Padding = new Padding(16, 12, 16, 12), BackColor = user ? Color.FromArgb(36, 43, 77) : Surface,
+                Location = new Point(user ? rowWidth - bubbleWidth - 4 : 4, 3) };
+            bubble.Controls.Add(new Label { Text = m.Content, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(234, 238, 247), Font = new Font("Segoe UI", 10.5f), TextAlign = ContentAlignment.TopLeft });
+            bubble.Controls.Add(new Label { Text = $"{(user ? "YOU" : "TOKI")}  ·  {m.At:g}", Dock = DockStyle.Top, Height = 30, ForeColor = user ? Color.FromArgb(177, 185, 255) : Color.FromArgb(112, 220, 196), Font = new Font("Segoe UI Semibold", 9) });
+            var copyMenu = new ContextMenuStrip(); copyMenu.Items.Add("Copy message", null, (_, _) => Clipboard.SetText(m.Content));
+            bubble.ContextMenuStrip = copyMenu;
+            foreach (Control child in bubble.Controls) child.ContextMenuStrip = copyMenu;
+            row.Controls.Add(bubble); history.Controls.Add(row);
+        }
+        history.ResumeLayout();
+        if (history.Controls.Count > 0) history.ScrollControlIntoView(history.Controls[^1]);
+        lastChatRefresh = DateTime.UtcNow;
     }
     private async Task Send()
     {
@@ -374,7 +464,8 @@ internal sealed class ChatForm : Form
                     if (chunk.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
                     {
                         answer.Append(content.GetString());
-                        app.Data.Messages[^1].Content = answer.ToString(); RefreshChat();
+                        app.Data.Messages[^1].Content = answer.ToString();
+                        if ((DateTime.UtcNow - lastChatRefresh).TotalMilliseconds > 280) RefreshChat();
                     }
                 }
                 catch (JsonException) { }
@@ -476,41 +567,63 @@ internal sealed class ChatForm : Form
         }
         return null;
     }
-    private TabPage MakeReminders()
+    private Panel MakeReminders()
     {
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2 };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 130)); root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var editor = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true };
-        var title = new TextBox { Width = 290, PlaceholderText = "What should I remind you about?" };
-        var due = new DateTimePicker { Width = 230, Format = DateTimePickerFormat.Custom, CustomFormat = "ddd, dd MMM yyyy  hh:mm tt", Value = DateTime.Now.AddHours(1) };
-        var repeat = new ComboBox { Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, BackColor = Canvas };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 162)); root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48)); root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var editorCard = new SurfaceCard { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 12), Margin = new Padding(4, 4, 4, 12) };
+        var editor = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 3, BackColor = Surface };
+        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32)); editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36)); editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 42)); editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        editor.Controls.Add(new Label { Text = "Create a reminder", Dock = DockStyle.Fill, Font = new Font("Segoe UI Semibold", 12), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        editor.SetColumnSpan(editor.GetControlFromPosition(0, 0)!, 3);
+        var title = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "What should I remind you about?", Margin = new Padding(0, 3, 10, 3) };
+        var due = new DateTimePicker { Dock = DockStyle.Fill, Format = DateTimePickerFormat.Custom, CustomFormat = "dd MMM yyyy  hh:mm tt", Value = DateTime.Now.AddHours(1), Margin = new Padding(0, 3, 10, 3) };
+        var repeat = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 3, 0, 3) };
         repeat.Items.AddRange(new object[] { "None", "Daily", "Weekly" }); repeat.SelectedIndex = 0;
-        editor.Controls.Add(title); editor.Controls.Add(due); editor.Controls.Add(repeat);
-        editor.Controls.Add(Button("Add reminder", (_, _) =>
+        editor.Controls.Add(title, 0, 1); editor.Controls.Add(due, 1, 1); editor.Controls.Add(repeat, 2, 1);
+        var add = Button("Add reminder", (_, _) =>
         {
             if (string.IsNullOrWhiteSpace(title.Text) || due.Value <= DateTime.Now) { MessageBox.Show("Enter a description and a future date."); return; }
             app.Data.Reminders.Add(new Reminder { Text = title.Text.Trim(), Due = due.Value, Recurrence = repeat.Text }); app.Save(); title.Clear(); RefreshReminders();
-        }));
-        root.Controls.Add(editor, 0, 0); root.Controls.Add(reminders, 0, 1);
+        });
+        add.Dock = DockStyle.Left; add.Height = 36; add.Margin = new Padding(0, 8, 0, 0);
+        editor.Controls.Add(add, 0, 2); editorCard.Controls.Add(editor);
+        root.Controls.Add(editorCard, 0, 0);
+        root.Controls.Add(new Label { Text = "UPCOMING & COMPLETED", Dock = DockStyle.Fill, Font = new Font("Segoe UI Semibold", 9), ForeColor = Muted, Padding = new Padding(6, 12, 0, 0) }, 0, 1);
+        reminders.BackColor = Canvas; reminders.Padding = new Padding(4, 0, 8, 0);
+        reminders.Resize += (_, _) => ResizeReminderCards();
+        root.Controls.Add(reminders, 0, 2);
         return Page("Reminders", root);
+    }
+    private void ResizeReminderCards()
+    {
+        var width = Math.Max(340, reminders.ClientSize.Width - 30);
+        foreach (Control card in reminders.Controls) card.Width = width;
     }
     private void RefreshReminders()
     {
-        reminders.Controls.Clear();
+        reminders.SuspendLayout(); reminders.Controls.Clear();
+        if (app.Data.Reminders.Count == 0)
+            reminders.Controls.Add(new Label { Text = "No reminders yet. Add one above or ask TOKI in Chat.", AutoSize = true, ForeColor = Muted, Padding = new Padding(10, 10, 0, 0) });
         foreach (var r in app.Data.Reminders.OrderBy(x => x.Completed).ThenBy(x => x.Due).ToList())
         {
-            var row = new FlowLayoutPanel { Width = 410, Height = 70, BackColor = Color.FromArgb(38, 42, 57) };
-            row.Controls.Add(new Label { Text = $"{r.Text}\n{r.Due:g} • {r.Recurrence}" + (r.Completed ? " • Done" : ""), Width = 215, Height = 62, ForeColor = Color.White });
+            var row = new SurfaceCard { Width = Math.Max(340, reminders.ClientSize.Width - 30), Height = 88, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(17, 11, 15, 10) };
+            var actions = new FlowLayoutPanel { Dock = DockStyle.Right, Width = r.Completed ? 100 : 250, BackColor = Surface, WrapContents = false, FlowDirection = FlowDirection.RightToLeft };
+            row.Controls.Add(actions);
+            var detail = new Label { Text = $"{r.Text}\n{r.Due:ddd, dd MMM yyyy · h:mm tt}   ·   {(r.Completed ? "Completed" : r.Recurrence)}", Dock = DockStyle.Fill, ForeColor = r.Completed ? Muted : Color.White, Font = new Font("Segoe UI", 10), AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+            row.Controls.Add(detail);
             if (!r.Completed)
             {
-                row.Controls.Add(Button("Snooze", (_, _) => { r.Due = DateTime.Now.AddMinutes(10); app.Save(); RefreshReminders(); }));
-                row.Controls.Add(Button("Done", (_, _) => { r.Completed = true; app.Save(); RefreshReminders(); }));
+                actions.Controls.Add(SecondaryButton("Snooze", (_, _) => { r.Due = DateTime.Now.AddMinutes(10); app.Save(); RefreshReminders(); }));
+                actions.Controls.Add(SecondaryButton("Done", (_, _) => { r.Completed = true; app.Save(); RefreshReminders(); }));
             }
-            row.Controls.Add(Button("×", (_, _) => { app.Data.Reminders.Remove(r); app.Save(); RefreshReminders(); }));
+            actions.Controls.Add(SecondaryButton("Delete", (_, _) => { app.Data.Reminders.Remove(r); app.Save(); RefreshReminders(); }));
             reminders.Controls.Add(row);
         }
+        reminders.ResumeLayout(); ResizeReminderCards();
     }
-    private TabPage MakeEmail()
+    private Panel MakeEmail()
     {
         var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false };
         panel.Controls.Add(new Label { Text = "Email composer", AutoSize = true, Font = new Font(Font, FontStyle.Bold) });
@@ -558,32 +671,33 @@ internal sealed class ChatForm : Form
         panel.Controls.Add(new Label { Text = "OAuth app client IDs are configured in Settings. TOKI never asks for your email password. Connected sending always requires preview approval.", Width = 390, Height = 60 });
         return Page("Email", panel);
     }
-    private TabPage MakePremiumEmail()
+    private Panel MakePremiumEmail()
     {
         var gallery = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, WrapContents = true, BackColor = Canvas };
-        var accountCard = new SurfaceCard { Height = 380, Padding = new Padding(20), Margin = new Padding(8) };
-        var composeCard = new SurfaceCard { Height = 670, Padding = new Padding(20), Margin = new Padding(8) };
+        var accountCard = new SurfaceCard { Height = 394, Padding = new Padding(20), Margin = new Padding(8) };
+        var composeCard = new SurfaceCard { Height = 606, Padding = new Padding(20), Margin = new Padding(8) };
         var accountContent = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Surface };
-        accountContent.Controls.Add(new Label { Text = "CONNECTED ACCOUNTS", Height = 28, Width = 440, Font = new Font("Segoe UI Semibold", 10), ForeColor = Color.FromArgb(161, 175, 202) });
+        accountContent.Controls.Add(new Label { Text = "Connected accounts", Height = 34, Width = 440, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White });
         var identity = new FlowLayoutPanel { Height = 56, Width = 440, BackColor = Surface, WrapContents = false };
         identity.Controls.Add(accountAvatar); identity.Controls.Add(accountStatus); accountContent.Controls.Add(identity);
         accountContent.Controls.Add(new Label { Text = "Active sender", Height = 26, Width = 440, ForeColor = Color.FromArgb(161, 175, 202) });
         accountBox = new ComboBox { Width = 440, Height = 38, DropDownStyle = ComboBoxStyle.DropDownList };
+        accountEmpty = new Label { Text = "No account selected", Width = 440, Height = 34, BackColor = InputSurface, ForeColor = Muted, Padding = new Padding(10, 7, 0, 0) };
         accountBox.SelectedIndexChanged += (_, _) =>
         {
             var selected = SelectedAccount(); app.Data.ActiveEmailAccountId = selected?.Id; app.Save(); UpdateAccountDisplay();
         };
-        RefreshAccounts(); accountContent.Controls.Add(accountBox);
+        accountContent.Controls.Add(accountBox); accountContent.Controls.Add(accountEmpty); RefreshAccounts();
         var connectionButtons = new FlowLayoutPanel { Width = 440, Height = 54, BackColor = Surface, WrapContents = false };
-        gmailButton = Button("+ Gmail account", async (_, _) => await ConnectEmail("Gmail"));
-        outlookButton = Button("+ Outlook account", async (_, _) => await ConnectEmail("Outlook"));
+        gmailButton = SecondaryButton("+ Gmail", async (_, _) => await ConnectEmail("Gmail"));
+        outlookButton = SecondaryButton("+ Outlook", async (_, _) => await ConnectEmail("Outlook"));
         connectionButtons.Controls.Add(gmailButton); connectionButtons.Controls.Add(outlookButton); accountContent.Controls.Add(connectionButtons);
         connectionStatus.Text = SelectedAccount() == null ? "Choose an account to connect." : "Your account is ready to use.";
         accountContent.Controls.Add(connectionStatus);
         var accountActions = new FlowLayoutPanel { Width = 440, Height = 48, BackColor = Surface, WrapContents = false };
-        cancelConnectionButton = Button("Cancel sign-in", (_, _) => connectionCancellation?.Cancel()); cancelConnectionButton.Enabled = false;
+        cancelConnectionButton = SecondaryButton("Cancel sign-in", (_, _) => connectionCancellation?.Cancel()); cancelConnectionButton.Enabled = false;
         accountActions.Controls.Add(cancelConnectionButton);
-        accountActions.Controls.Add(Button("Disconnect", (_, _) =>
+        accountActions.Controls.Add(SecondaryButton("Disconnect", (_, _) =>
         {
             var account = SelectedAccount(); if (account == null) return;
             if (MessageBox.Show(this, $"Remove {account.Address} from TOKI?", "Disconnect", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
@@ -593,15 +707,15 @@ internal sealed class ChatForm : Form
         accountContent.Controls.Add(accountActions); accountCard.Controls.Add(accountContent);
 
         var compose = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Surface };
-        compose.Controls.Add(new Label { Text = "COMPOSE EMAIL", Height = 32, Width = 440, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White });
+        compose.Controls.Add(new Label { Text = "Compose email", Height = 36, Width = 440, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White });
         compose.Controls.Add(new Label { Text = "Write, review, and send from your connected account.", Height = 34, Width = 440, ForeColor = Color.FromArgb(161, 175, 202) });
         var recipient = new TextBox { Width = 440, Height = 36, PlaceholderText = "To · recipient@example.com" };
         var subject = new TextBox { Width = 440, Height = 36, PlaceholderText = "Subject" };
-        var body = new TextBox { Width = 440, Height = 270, Multiline = true, ScrollBars = ScrollBars.Vertical, PlaceholderText = "Write your message..." };
+        var body = new TextBox { Width = 440, Height = 240, Multiline = true, ScrollBars = ScrollBars.Vertical, PlaceholderText = "Write your message..." };
         compose.Controls.Add(recipient); compose.Controls.Add(subject); compose.Controls.Add(body);
         var readActions = new FlowLayoutPanel { Width = 440, Height = 53, BackColor = Surface, WrapContents = false };
-        readActions.Controls.Add(Button("Latest inbox", async (_, _) => await ShowInbox(false)));
-        readActions.Controls.Add(Button("Unread inbox", async (_, _) => await ShowInbox(true))); compose.Controls.Add(readActions);
+        readActions.Controls.Add(SecondaryButton("Latest inbox", async (_, _) => await ShowInbox(false)));
+        readActions.Controls.Add(SecondaryButton("Unread inbox", async (_, _) => await ShowInbox(true))); compose.Controls.Add(readActions);
         var sendActions = new FlowLayoutPanel { Width = 440, Height = 53, BackColor = Surface, WrapContents = false };
         sendActions.Controls.Add(Button("Review & send", async (_, _) =>
         {
@@ -611,7 +725,7 @@ internal sealed class ChatForm : Form
             try { await email.SendAsync(account, recipient.Text.Trim(), subject.Text, body.Text); app.Notify("TOKI email", "Email sent."); MessageBox.Show(this, "Email sent.", "TOKI"); }
             catch (Exception ex) { app.Notify("TOKI email", "Email sending failed."); MessageBox.Show(this, ex.Message, "TOKI"); }
         }));
-        sendActions.Controls.Add(Button("Open in mail app", (_, _) =>
+        sendActions.Controls.Add(SecondaryButton("Open in mail app", (_, _) =>
         {
             if (!Regex.IsMatch(recipient.Text.Trim(), @"^[^\s@]+@[^\s@]+\.[^\s@]+$")) { MessageBox.Show(this, "Enter a valid recipient address.", "TOKI"); return; }
             var uri = $"mailto:{Uri.EscapeDataString(recipient.Text.Trim())}?subject={Uri.EscapeDataString(subject.Text)}&body={Uri.EscapeDataString(body.Text)}";
@@ -625,13 +739,14 @@ internal sealed class ChatForm : Form
         void ArrangeCards()
         {
             var width = Math.Max(430, gallery.ClientSize.Width);
-            var sideBySide = width >= 960;
+            var sideBySide = width >= 790;
             var cardWidth = sideBySide ? Math.Min(520, (width - 56) / 2) : Math.Min(620, width - 36);
             var groupWidth = sideBySide ? 2 * (cardWidth + 16) : cardWidth + 16;
             gallery.Padding = new Padding(Math.Max(8, (width - groupWidth) / 2), 12, 8, 12);
             accountCard.Width = cardWidth; composeCard.Width = cardWidth;
             var innerWidth = cardWidth - 48;
             identity.Width = innerWidth; accountStatus.Width = innerWidth - 52; accountBox.Width = innerWidth;
+            accountEmpty.Width = innerWidth;
             connectionStatus.Width = innerWidth; connectionButtons.Width = innerWidth; accountActions.Width = innerWidth;
             recipient.Width = innerWidth; subject.Width = innerWidth; body.Width = innerWidth;
             readActions.Width = innerWidth; sendActions.Width = innerWidth;
@@ -644,6 +759,8 @@ internal sealed class ChatForm : Form
     {
         if (accountBox == null) return;
         accountBox.Items.Clear(); foreach (var a in app.Data.Accounts) accountBox.Items.Add($"{a.Provider} • {a.Address}");
+        accountBox.Visible = accountBox.Items.Count > 0;
+        if (accountEmpty != null) accountEmpty.Visible = accountBox.Items.Count == 0;
         if (accountBox.Items.Count > 0)
         {
             var selected = app.Data.Accounts.FindIndex(a => a.Id == app.Data.ActiveEmailAccountId);
@@ -692,11 +809,13 @@ internal sealed class ChatForm : Form
         try { var messages = await email.InboxAsync(account, unread); MessageBox.Show(messages.Count == 0 ? "No messages found." : string.Join("\n\n────────\n\n", messages), unread ? "Unread inbox" : "Latest inbox"); }
         catch (Exception ex) { MessageBox.Show("Inbox failed: " + ex.Message); }
     }
-    private TabPage MakeUsage()
+    private Panel MakeUsage()
     {
-        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false };
-        panel.Controls.Add(new Label { Text = "ChatGPT usage • manual estimate", AutoSize = true, Font = new Font(Font, FontStyle.Bold) });
-        panel.Controls.Add(new Label { Text = "Live subscription usage is unavailable. Enter your own plan, limit and used count. API usage is separate from ChatGPT usage.", Width = 390, Height = 75 });
+        var gallery = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false, BackColor = Canvas };
+        var card = new SurfaceCard { Height = 550, Padding = new Padding(24), Margin = new Padding(4, 4, 4, 12) };
+        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Surface };
+        panel.Controls.Add(new Label { Text = "Manual usage tracker", Width = 600, Height = 38, Font = new Font("Segoe UI Semibold", 14), ForeColor = Color.White });
+        panel.Controls.Add(new Label { Text = "Live ChatGPT subscription usage is unavailable. Enter your own limit and used count to see an estimate. API usage is separate.", Width = 600, Height = 58, ForeColor = Muted });
         var plan = new TextBox { Width = 250, PlaceholderText = "Plan (optional)", Text = app.Data.Usage.Plan };
         var limit = new NumericUpDown { Width = 140, Maximum = 1000000, Value = Math.Clamp(app.Data.Usage.Limit, 0, 1000000) };
         var used = new NumericUpDown { Width = 140, Maximum = 1000000, Value = Math.Clamp(app.Data.Usage.Used, 0, 1000000) };
@@ -716,35 +835,66 @@ internal sealed class ChatForm : Form
             u.Warning = (int)warning.Value; u.Critical = (int)critical.Value; u.WarningSent = false; u.CriticalSent = false;
             app.Save(); RefreshUsage();
         }));
+        usageStatus.Font = new Font("Segoe UI Semibold", 11); usageStatus.ForeColor = Color.White;
         panel.Controls.Add(usageStatus);
-        var link = new LinkLabel { Text = "Open ChatGPT settings", AutoSize = true, LinkColor = Color.Cyan };
+        var link = new LinkLabel { Text = "Open ChatGPT settings ↗", AutoSize = true, LinkColor = Color.FromArgb(147, 170, 255) };
         link.Click += (_, _) => Process.Start(new ProcessStartInfo("https://chatgpt.com/settings/usage") { UseShellExecute = true });
         panel.Controls.Add(link);
-        return Page("Usage", panel);
+        card.Controls.Add(panel); gallery.Controls.Add(card);
+        gallery.Resize += (_, _) => { card.Width = Math.Min(720, Math.Max(420, gallery.ClientSize.Width - 28)); gallery.Padding = new Padding(Math.Max(4, (gallery.ClientSize.Width - card.Width - 8) / 2), 0, 0, 0); };
+        return Page("Usage", gallery);
     }
     private void RefreshUsage()
     {
         var u = app.Data.Usage;
         usageStatus.Text = u.Limit <= 0 ? "No manual usage estimate set." : $"Manual estimate: {u.Used}/{u.Limit} ({100.0 * u.Used / u.Limit:0}%)";
     }
-    private TabPage MakeSettings()
+    private Panel MakeSettings()
     {
-        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false };
+        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false, BackColor = Canvas };
+        var cards = new List<SurfaceCard>();
+        FlowLayoutPanel Section(string title, int height)
+        {
+            var card = new SurfaceCard { Height = height, Padding = new Padding(22, 18, 22, 14), Margin = new Padding(4, 4, 4, 12) };
+            var content = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Surface };
+            content.Controls.Add(new Label { Text = title, Width = 600, Height = 38, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White });
+            card.Controls.Add(content); panel.Controls.Add(card); cards.Add(card); return content;
+        }
+        var aiSection = Section("AI provider", 390);
+        var emailSection = Section("Email connections", 260);
+        var generalSection = Section("General & voice", 450);
+        var shortcutSection = Section("App shortcuts", 480);
+        var privacySection = Section("Privacy & data", 230);
+        panel.Resize += (_, _) =>
+        {
+            var cardWidth = Math.Min(740, Math.Max(470, panel.ClientSize.Width - 28));
+            panel.Padding = new Padding(Math.Max(4, (panel.ClientSize.Width - cardWidth - 8) / 2), 0, 0, 0);
+            foreach (var card in cards)
+            {
+                card.Width = cardWidth;
+                foreach (Control content in card.Controls)
+                    foreach (Control item in content.Controls)
+                    {
+                        if (item is TextBox or ComboBox or ListBox) item.Width = cardWidth - 54;
+                        else if (item is Label label && !label.AutoSize) label.Width = cardWidth - 54;
+                    }
+            }
+        };
         var googleClient = new TextBox { Width = 280, PlaceholderText = "Google OAuth client ID", Text = app.Data.GoogleClientId };
         string? importedGoogleSecret = null;
         string? importedGoogleClientId = null;
         var microsoftClient = new TextBox { Width = 280, PlaceholderText = "Microsoft OAuth client ID", Text = app.Data.MicrosoftClientId };
-        panel.Controls.Add(new Label { Text = "AI provider", AutoSize = true, Font = new Font(Font, FontStyle.Bold) });
         providerBox.Items.AddRange(new object[] { "OpenAI", "OpenAI-compatible" }); providerBox.SelectedItem = app.Data.Provider;
         if (providerBox.SelectedIndex < 0) providerBox.SelectedIndex = 0;
         modelBox.Text = app.Data.Model; urlBox.Text = app.Data.BaseUrl;
-        panel.Controls.Add(providerBox);
-        panel.Controls.Add(new Label { Text = "Model", AutoSize = true }); panel.Controls.Add(modelBox);
-        panel.Controls.Add(new Label { Text = "API base URL (HTTPS)", AutoSize = true }); panel.Controls.Add(urlBox);
-        panel.Controls.Add(new Label { Text = "API key (leave blank to keep existing)", AutoSize = true }); panel.Controls.Add(keyBox);
-        panel.Controls.Add(new Label { Text = "ChatGPT subscription access does not automatically include API credits. Eligible plans may offer separate API credit benefits; check your API billing.", Width = 390, Height = 70 });
-        panel.Controls.Add(new Label { Text = "Email OAuth client IDs", AutoSize = true }); panel.Controls.Add(googleClient); panel.Controls.Add(microsoftClient);
-        panel.Controls.Add(Button("Import Google desktop OAuth JSON", (_, _) =>
+        aiSection.Controls.Add(providerBox);
+        aiSection.Controls.Add(new Label { Text = "Model", AutoSize = true }); aiSection.Controls.Add(modelBox);
+        aiSection.Controls.Add(new Label { Text = "API base URL (HTTPS)", AutoSize = true }); aiSection.Controls.Add(urlBox);
+        aiSection.Controls.Add(new Label { Text = "API key (leave blank to keep existing)", AutoSize = true }); aiSection.Controls.Add(keyBox);
+        aiSection.Controls.Add(new Label { Text = "ChatGPT subscriptions and API billing are separate. TOKI only uses an API when you configure a key and send a chat request.", Width = 610, Height = 52, ForeColor = Muted });
+        emailSection.Controls.Add(new Label { Text = "Connect Gmail or Outlook from the Email page after adding the provider's OAuth client ID.", Width = 610, Height = 38, ForeColor = Muted });
+        emailSection.Controls.Add(googleClient); emailSection.Controls.Add(microsoftClient);
+        emailSection.Controls.Add(SecondaryButton("Import Google desktop OAuth JSON", (_, _) =>
         {
             using var picker = new OpenFileDialog { Filter = "Google OAuth JSON (*.json)|*.json", Title = "Select Google Desktop OAuth credentials" };
             if (picker.ShowDialog() != DialogResult.OK) return;
@@ -771,11 +921,11 @@ internal sealed class ChatForm : Form
         hotkey.Items.AddRange(new object[] { "Ctrl+Alt+T", "Ctrl+Shift+Space", "Off" });
         hotkey.SelectedItem = app.Data.OpenHotkey;
         if (hotkey.SelectedIndex < 0) hotkey.SelectedIndex = 0;
-        panel.Controls.Add(startup); panel.Controls.Add(top); panel.Controls.Add(notifications);
-        panel.Controls.Add(speak); panel.Controls.Add(new Label { Text = "Speech speed", AutoSize = true }); panel.Controls.Add(speechRate);
-        panel.Controls.Add(new Label { Text = "Floating icon size", AutoSize = true }); panel.Controls.Add(size);
-        panel.Controls.Add(new Label { Text = "Keyboard shortcut to open TOKI", AutoSize = true }); panel.Controls.Add(hotkey);
-        panel.Controls.Add(Button("Save settings", (_, _) =>
+        generalSection.Controls.Add(startup); generalSection.Controls.Add(top); generalSection.Controls.Add(notifications);
+        generalSection.Controls.Add(speak); generalSection.Controls.Add(new Label { Text = "Speech speed", AutoSize = true }); generalSection.Controls.Add(speechRate);
+        generalSection.Controls.Add(new Label { Text = "Floating icon size", AutoSize = true }); generalSection.Controls.Add(size);
+        generalSection.Controls.Add(new Label { Text = "Keyboard shortcut to open TOKI", AutoSize = true }); generalSection.Controls.Add(hotkey);
+        generalSection.Controls.Add(Button("Save settings", (_, _) =>
         {
             if (!Uri.TryCreate(urlBox.Text.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != "https") { MessageBox.Show("Use an HTTPS API base URL."); return; }
             if (!app.SetOpenHotkey(hotkey.Text)) { MessageBox.Show(this, "Windows is already using that shortcut. Choose another one.", "TOKI"); return; }
@@ -803,40 +953,39 @@ internal sealed class ChatForm : Form
             catch (Exception ex) { MessageBox.Show("Startup setting failed: " + ex.Message); }
             app.Save(); MessageBox.Show("Saved. Restart TOKI to apply icon size and always-on-top changes.");
         }));
-        panel.Controls.Add(Button("Delete API key", (_, _) => { app.Data.EncryptedKey = ""; app.Save(); MessageBox.Show("API key deleted."); }));
-        panel.Controls.Add(Button("Clear chat history", (_, _) => { if (MessageBox.Show("Delete local chat history?", "TOKI", MessageBoxButtons.YesNo) == DialogResult.Yes) { app.Data.Messages.Clear(); app.Save(); RefreshChat(); } }));
-        panel.Controls.Add(new Label { Text = "App shortcuts", AutoSize = true, Font = new Font(Font, FontStyle.Bold) });
-        panel.Controls.Add(new Label { Text = "Choose an .exe or Windows .lnk shortcut, give it a name, then say 'open <name>' in Chat.", Width = 390, Height = 48 });
+        privacySection.Controls.Add(SecondaryButton("Delete API key", (_, _) => { app.Data.EncryptedKey = ""; app.Save(); MessageBox.Show("API key deleted."); }));
+        privacySection.Controls.Add(SecondaryButton("Clear chat history", (_, _) => { if (MessageBox.Show("Delete local chat history?", "TOKI", MessageBoxButtons.YesNo) == DialogResult.Yes) { app.Data.Messages.Clear(); app.Save(); RefreshChat(); } }));
+        shortcutSection.Controls.Add(new Label { Text = "Choose an .exe or Windows .lnk shortcut, name it, then say 'open <name>' in Chat.", Width = 610, Height = 38, ForeColor = Muted });
         var shortcuts = new ListBox { Width = 390, Height = 108 };
         void RefreshShortcuts()
         {
             shortcuts.Items.Clear();
             foreach (var item in app.Data.AppShortcuts) shortcuts.Items.Add($"{item.Name}  ·  {Path.GetFileName(item.Path)}");
         }
-        RefreshShortcuts(); panel.Controls.Add(shortcuts);
+        RefreshShortcuts(); shortcutSection.Controls.Add(shortcuts);
         var shortcutName = new TextBox { Width = 390, PlaceholderText = "Name, e.g. Photoshop" };
         var shortcutPath = new TextBox { Width = 390, PlaceholderText = "Selected application", ReadOnly = true };
-        panel.Controls.Add(shortcutName); panel.Controls.Add(shortcutPath);
-        panel.Controls.Add(Button("Choose application or shortcut", (_, _) =>
+        shortcutSection.Controls.Add(shortcutName); shortcutSection.Controls.Add(shortcutPath);
+        shortcutSection.Controls.Add(SecondaryButton("Choose application or shortcut", (_, _) =>
         {
             using var picker = new OpenFileDialog { Filter = "Applications and Windows shortcuts (*.exe;*.lnk)|*.exe;*.lnk", Title = "Choose an application" };
             if (picker.ShowDialog(this) != DialogResult.OK) return;
             shortcutPath.Text = picker.FileName;
             if (shortcutName.TextLength == 0) shortcutName.Text = Path.GetFileNameWithoutExtension(picker.FileName);
         }));
-        panel.Controls.Add(Button("Add app shortcut", (_, _) =>
+        shortcutSection.Controls.Add(Button("Add app shortcut", (_, _) =>
         {
             var name = shortcutName.Text.Trim();
             if (name.Length == 0 || !File.Exists(shortcutPath.Text)) { MessageBox.Show(this, "Enter a name and choose an existing application or shortcut.", "TOKI"); return; }
             if (app.Data.AppShortcuts.Any(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) { MessageBox.Show(this, "That shortcut name already exists.", "TOKI"); return; }
             app.Data.AppShortcuts.Add(new AppShortcut { Name = name, Path = shortcutPath.Text }); app.Save(); RefreshShortcuts(); shortcutName.Clear(); shortcutPath.Clear();
         }));
-        panel.Controls.Add(Button("Remove selected shortcut", (_, _) =>
+        shortcutSection.Controls.Add(SecondaryButton("Remove selected shortcut", (_, _) =>
         {
             if (shortcuts.SelectedIndex < 0) return;
             app.Data.AppShortcuts.RemoveAt(shortcuts.SelectedIndex); app.Save(); RefreshShortcuts();
         }));
-        panel.Controls.Add(new Label { Text = "Local data: " + Store.DirectoryPath, Width = 390, Height = 45 });
+        privacySection.Controls.Add(new Label { Text = "Local data: " + Store.DirectoryPath, Width = 610, Height = 42, ForeColor = Muted });
         return Page("Settings", panel);
     }
 }
@@ -898,5 +1047,27 @@ internal sealed class SurfaceCard : Panel
         using var outline = Outline(new Rectangle(0, 0, Width - 1, Height - 1), 14);
         using var border = new Pen(Color.FromArgb(58, 68, 93));
         e.Graphics.DrawPath(border, outline);
+    }
+}
+
+internal static class TokiIcon
+{
+    [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
+    public static Icon Create()
+    {
+        using var bitmap = new Bitmap(64, 64);
+        using (var graphics = Graphics.FromImage(bitmap))
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.Clear(Color.Transparent);
+            using var fill = new LinearGradientBrush(new Rectangle(0, 0, 64, 64), Color.FromArgb(113, 119, 255), Color.FromArgb(58, 201, 211), 45);
+            graphics.FillEllipse(fill, 3, 3, 58, 58);
+            using var type = new Font("Segoe UI Semibold", 36, FontStyle.Bold, GraphicsUnit.Pixel);
+            TextRenderer.DrawText(graphics, "T", type, new Rectangle(3, 3, 58, 58), Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+        var handle = bitmap.GetHicon();
+        try { return (Icon)Icon.FromHandle(handle).Clone(); }
+        finally { DestroyIcon(handle); }
     }
 }
