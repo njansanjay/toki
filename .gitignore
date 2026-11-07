@@ -1,0 +1,10 @@
+bin/
+obj/
+dist/
+.dist/
+.vs/
+.vscode/
+oauth.local.json
+InspectGoogleAuth.ps1
+InspectToki.ps1
+VerifyGoogleAuth.ps1
