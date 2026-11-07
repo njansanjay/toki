@@ -15,7 +15,9 @@ internal static class Program
     static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new TokiApp(args.Contains("--open", StringComparer.OrdinalIgnoreCase)));
+        var app = new TokiApp(args.Contains("--open", StringComparer.OrdinalIgnoreCase));
+        if (args.Contains("--launcher", StringComparer.OrdinalIgnoreCase)) app.ShowLauncher();
+        Application.Run(app);
     }
 }
 
@@ -25,6 +27,7 @@ internal sealed class TokiApp : ApplicationContext
     private readonly NotifyIcon tray;
     private readonly OrbForm orb;
     private ChatForm? chat;
+    private ShortcutLauncherForm? launcher;
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 15000 };
     private bool paused;
 
@@ -58,6 +61,7 @@ internal sealed class TokiApp : ApplicationContext
         orb = new OrbForm(this);
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open TOKI", null, (_, _) => Open());
+        menu.Items.Add("App shortcuts", null, (_, _) => ShowLauncher());
         menu.Items.Add("New chat", null, (_, _) => { Data.Messages.Clear(); Save(); Open(); chat?.RefreshChat(); });
         menu.Items.Add("Add reminder", null, (_, _) => { Open(); chat?.SelectTab(1); });
         menu.Items.Add("Email assistant", null, (_, _) => { Open(); chat?.SelectTab(2); });
@@ -77,11 +81,33 @@ internal sealed class TokiApp : ApplicationContext
 
     internal void Save() => Store.Save(Data);
     internal bool SetOpenHotkey(string value) => orb.SetOpenHotkey(value);
-    internal void Open()
+    internal void Open(int page = 0)
     {
+        launcher?.Hide();
         if (chat is null || chat.IsDisposed) chat = new ChatForm(this);
+        chat.SelectTab(page);
+        if (chat.WindowState == FormWindowState.Minimized) chat.WindowState = FormWindowState.Normal;
         chat.Show();
         chat.Activate();
+    }
+    internal void TogglePrimary()
+    {
+        var page = PrimaryViews.PageIndex(Data.PrimaryView);
+        if (page != 5) { Open(page); return; }
+        if (launcher?.Visible == true) launcher.Hide(); else ShowLauncher();
+    }
+    internal void ShowLauncher()
+    {
+        if (launcher is null || launcher.IsDisposed) launcher = new ShortcutLauncherForm(this);
+        launcher.ShowNear(orb.Bounds);
+    }
+    internal void OpenShortcutSettings() { Open(4); chat?.FocusShortcutSettings(); }
+    internal void RefreshShortcuts() { chat?.RefreshShortcutGallery(); launcher?.RefreshShortcuts(); }
+    internal void ApplyAppearance()
+    {
+        orb.ApplyAppearance();
+        if (chat != null) chat.TopMost = Data.TopMost;
+        if (launcher != null) launcher.TopMost = Data.TopMost;
     }
     internal void Notify(string title, string message)
     {
@@ -118,7 +144,7 @@ internal sealed class TokiApp : ApplicationContext
     }
     internal void Exit()
     {
-        timer.Stop(); Save(); tray.Visible = false; tray.Dispose(); orb.Close(); chat?.Dispose(); ExitThread();
+        timer.Stop(); Save(); tray.Visible = false; tray.Dispose(); launcher?.Dispose(); orb.Close(); chat?.Dispose(); ExitThread();
     }
 }
 
@@ -133,25 +159,63 @@ internal sealed class OrbForm : Form
     private Point dragOrigin;
     private Point windowOrigin;
     private bool moved;
+    private bool pointerDown;
+    private Point restingLocation;
+    private double floatPhase;
+    private readonly Stopwatch floatClock = Stopwatch.StartNew();
+    private readonly System.Windows.Forms.Timer floatTimer = new() { Interval = 16 };
+    private readonly LayeredRobot robotRenderer = new();
     public OrbForm(TokiApp app)
     {
         this.app = app;
+        AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         TopMost = app.Data.TopMost;
-        BackColor = Color.Magenta;
-        TransparencyKey = Color.Magenta;
-        var size = Math.Clamp(app.Data.OrbSize, 40, 120);
+        Text = "TOKI floating robot";
+        AccessibleName = "TOKI floating robot";
+        Icon = BrandAssets.CreateIcon(); Cursor = Cursors.Hand;
+        var size = Math.Clamp(app.Data.OrbSize, 40, 192);
+        MinimumSize = new Size(size, size); MaximumSize = MinimumSize;
         Size = new Size(size, size);
         Location = new Point(app.Data.OrbX, app.Data.OrbY);
+        restingLocation = Location;
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Open", null, (_, _) => app.Open());
-        menu.Items.Add("Settings", null, (_, _) => { app.Open(); });
+        menu.Items.Add("One-touch view", null, (_, _) => app.TogglePrimary());
+        menu.Items.Add("Open full TOKI", null, (_, _) => app.Open(5));
+        menu.Items.Add("Settings", null, (_, _) => app.Open(4));
         menu.Items.Add("Exit", null, (_, _) => app.Exit());
         ContextMenuStrip = menu;
-        MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) { dragOrigin = Cursor.Position; windowOrigin = Location; moved = false; } };
+        MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) { pointerDown = true; dragOrigin = Cursor.Position; windowOrigin = Location; moved = false; } };
         MouseMove += (_, e) => { if (e.Button == MouseButtons.Left) { var delta = new Size(Cursor.Position.X - dragOrigin.X, Cursor.Position.Y - dragOrigin.Y); if (Math.Abs(delta.Width) + Math.Abs(delta.Height) > 4) moved = true; if (moved) Location = windowOrigin + delta; } };
-        MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) { if (moved) { app.Data.OrbX = Left; app.Data.OrbY = Top; app.Save(); } else app.Open(); } };
+        MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) { pointerDown = false; if (moved) { ClampToScreen(); restingLocation = Location; floatPhase = 0; app.Data.OrbX = Left; app.Data.OrbY = Top; app.Save(); } else app.TogglePrimary(); } };
+        MouseCaptureChanged += (_, _) => { if (Control.MouseButtons == MouseButtons.None) pointerDown = false; };
+        floatTimer.Tick += (_, _) => AnimateFloat();
+    }
+    protected override CreateParams CreateParams { get { var parameters = base.CreateParams; parameters.ExStyle |= 0x00080000; return parameters; } }
+    protected override void OnShown(EventArgs e) { base.OnShown(e); ClampToScreen(); restingLocation = Location; robotRenderer.Render(this); floatClock.Restart(); floatTimer.Start(); }
+    private void AnimateFloat()
+    {
+        var elapsed = Math.Min(floatClock.Elapsed.TotalSeconds, 0.1); floatClock.Restart();
+        // Pause under the pointer so a moving target never gets in the way of a click or drag.
+        if (!app.Data.FloatAnimation || !SystemInformation.UIEffectsEnabled || pointerDown || Bounds.Contains(Cursor.Position) || ContextMenuStrip?.Visible == true) return;
+        floatPhase = (floatPhase + elapsed * Math.PI * 2 / 3.8) % (Math.PI * 2);
+        robotRenderer.Render(this, LayeredRobot.FloatOffset(floatPhase));
+    }
+    private void ClampToScreen()
+    {
+        var area = Screen.FromRectangle(Bounds).WorkingArea;
+        Location = new Point(Math.Clamp(Left, area.Left, Math.Max(area.Left, area.Right - Width)), Math.Clamp(Top, area.Top, Math.Max(area.Top, area.Bottom - Height)));
+    }
+    public void ApplyAppearance()
+    {
+        TopMost = app.Data.TopMost;
+        var size = Math.Clamp(app.Data.OrbSize, 40, 192);
+        MaximumSize = Size.Empty; MinimumSize = new Size(size, size); MaximumSize = MinimumSize; Size = MinimumSize;
+        Location = restingLocation; ClampToScreen(); restingLocation = Location; floatPhase = 0;
+        robotRenderer.Dispose();
+        if (IsHandleCreated) robotRenderer.Render(this);
     }
     protected override void OnHandleCreated(EventArgs e)
     {
@@ -184,17 +248,18 @@ internal sealed class OrbForm : Form
     }
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WmHotkey && m.WParam.ToInt32() == HotkeyId) app.Open();
+        if (m.Msg == WmHotkey && m.WParam.ToInt32() == HotkeyId) app.TogglePrimary();
         base.WndProc(ref m);
     }
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using var brush = new LinearGradientBrush(ClientRectangle, Color.FromArgb(112, 82, 255), Color.FromArgb(0, 202, 215), 45);
-        e.Graphics.FillEllipse(brush, 2, 2, Width - 4, Height - 4);
-        using var font = new Font("Segoe UI", Width * .22f, FontStyle.Bold);
-        TextRenderer.DrawText(e.Graphics, "T", font, ClientRectangle, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        // The robot is rendered with per-pixel transparency by LayeredRobot.
+    }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { floatTimer.Stop(); floatTimer.Dispose(); robotRenderer.Dispose(); }
+        base.Dispose(disposing);
     }
 }
 
@@ -231,7 +296,10 @@ internal sealed class ChatForm : Form
     private Button? outlookButton;
     private Button? cancelConnectionButton;
     private CancellationTokenSource? connectionCancellation;
-    private readonly Button[] navigation = new Button[5];
+    private readonly Button[] navigation = new Button[6];
+    private readonly ShortcutGrid shortcutGallery = new() { Dock = DockStyle.Fill };
+    private FlowLayoutPanel? settingsScroll;
+    private SurfaceCard? shortcutSettingsCard;
     private readonly Label sectionTitle = new() { AutoSize = true, Font = new Font("Segoe UI Semibold", 18), ForeColor = Color.White };
     private readonly Label sectionDescription = new() { AutoSize = true, ForeColor = Muted };
     private DateTime lastChatRefresh;
@@ -246,20 +314,20 @@ internal sealed class ChatForm : Form
         Font = new Font("Segoe UI", 10);
         AutoScaleMode = AutoScaleMode.Dpi;
         FormClosing += (_, e) => { if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
-        pages.AddRange(new[] { MakeChat(), MakeReminders(), MakePremiumEmail(), MakeUsage(), MakeSettings() });
+        pages.AddRange(new[] { MakeChat(), MakeReminders(), MakePremiumEmail(), MakeUsage(), MakeSettings(), MakeShortcuts() });
         foreach (var page in pages) { page.Dock = DockStyle.Fill; page.Visible = false; pageHost.Controls.Add(page); }
         var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, BackColor = Canvas, Margin = Padding.Empty, Padding = Padding.Empty };
         shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 212)); shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         var sidebar = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(18, 24, 37), Padding = new Padding(14, 22, 14, 18) };
-        var logo = new Label { Dock = DockStyle.Top, Height = 72, Text = "◉  TOKI", Font = new Font("Segoe UI Semibold", 15), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft };
+        var logo = new BrandWordmark { Dock = DockStyle.Top, Height = 72 };
         sidebar.Controls.Add(logo);
         var navHost = new FlowLayoutPanel { Location = new Point(14, 106), Size = new Size(184, 308), FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = sidebar.BackColor };
-        var names = new[] { "Chat", "Reminders", "Email", "Usage", "Settings" };
-        var symbols = new[] { "✦", "◷", "✉", "◕", "⚙" };
-        for (var i = 0; i < names.Length; i++)
+        var names = new[] { "Chat", "Reminders", "Email", "Usage", "Settings", "Shortcuts" };
+        var symbols = new[] { "✦", "◷", "✉", "◕", "⚙", "▦" };
+        foreach (var i in new[] { 5, 0, 1, 2, 3, 4 })
         {
             var index = i;
-            var nav = new Button { Text = $"  {symbols[i]}     {names[i]}", Width = 180, Height = 48, FlatStyle = FlatStyle.Flat,
+            var nav = new Button { Text = $"  {symbols[i]}     {names[i]}", Width = 180, Height = 42, FlatStyle = FlatStyle.Flat,
                 TextAlign = ContentAlignment.MiddleLeft, Font = new Font("Segoe UI Semibold", 10), Cursor = Cursors.Hand, Margin = new Padding(0, 0, 0, 7) };
             nav.FlatAppearance.BorderSize = 0;
             nav.Click += (_, _) => SelectTab(index);
@@ -316,7 +384,7 @@ internal sealed class ChatForm : Form
     }
     private void UpdateNavigation()
     {
-        var descriptions = new[] { "Your space to think, write, and get things done.", "Stay on top of what matters.", "Write and send with confidence.", "A clear view of your manual usage estimate.", "Make TOKI work the way you do." };
+        var descriptions = new[] { "Your space to think, write, and get things done.", "Stay on top of what matters.", "Write and send with confidence.", "A clear view of your manual usage estimate.", "Make TOKI work the way you do.", "Your favorite apps, one click away." };
         var selected = selectedPage;
         sectionTitle.Text = pages[selected].Text;
         sectionDescription.Text = descriptions[selected];
@@ -345,6 +413,32 @@ internal sealed class ChatForm : Form
         var b = Button(text, click); b.BackColor = InputSurface; b.ForeColor = Color.FromArgb(226, 231, 241);
         b.FlatAppearance.MouseOverBackColor = Color.FromArgb(47, 57, 79); return b;
     }
+    private Panel MakeShortcuts()
+    {
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        var actions = new FlowLayoutPanel { Dock = DockStyle.Fill };
+        actions.Controls.Add(Button("+ Add / manage apps", (_, _) => FocusShortcutSettings()));
+        actions.Controls.Add(SecondaryButton("Compact launcher", (_, _) => app.ShowLauncher()));
+        var status = new Label { Dock = DockStyle.Fill, ForeColor = Muted, Text = "Hover an icon for its name. Add apps from Settings.", TextAlign = ContentAlignment.MiddleLeft };
+        shortcutGallery.ShortcutClicked += shortcut =>
+        {
+            try { ShortcutService.Open(shortcut); status.Text = "Opened " + shortcut.Name + "."; }
+            catch (Exception ex) { status.Text = ex.Message; }
+        };
+        layout.Controls.Add(actions, 0, 0); layout.Controls.Add(shortcutGallery, 0, 1); layout.Controls.Add(status, 0, 2);
+        RefreshShortcutGallery();
+        return Page("Shortcuts", layout);
+    }
+    internal void RefreshShortcutGallery() => shortcutGallery.SetShortcuts(app.Data.AppShortcuts);
+    internal void FocusShortcutSettings()
+    {
+        SelectTab(4);
+        if (settingsScroll != null && shortcutSettingsCard != null)
+            settingsScroll.ScrollControlIntoView(shortcutSettingsCard);
+    }
     private Panel MakeChat()
     {
         var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, BackColor = Canvas };
@@ -369,7 +463,7 @@ internal sealed class ChatForm : Form
         panel.Controls.Add(composer, 0, 1);
         var quick = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = Canvas, Padding = new Padding(4, 3, 0, 0) };
         quick.Controls.Add(SecondaryButton("+ Reminder", (_, _) => SelectTab(1))); quick.Controls.Add(SecondaryButton("✉ Email", (_, _) => SelectTab(2)));
-        quick.Controls.Add(SecondaryButton("▦ Open app", (sender, _) => ShowAppsMenu((Control)sender!)));
+        quick.Controls.Add(SecondaryButton("▦ Shortcuts", (_, _) => SelectTab(5)));
         panel.Controls.Add(quick, 0, 2);
         return Page("Chat", panel);
     }
@@ -533,7 +627,7 @@ internal sealed class ChatForm : Form
             if (custom != null)
             {
                 if (!File.Exists(custom.Path)) return $"The shortcut for {custom.Name} no longer points to an existing app. Update it in Settings.";
-                try { Process.Start(new ProcessStartInfo(custom.Path) { UseShellExecute = true }); return $"Opened {custom.Name}."; }
+                try { ShortcutService.Open(custom); return $"Opened {custom.Name}."; }
                 catch (Exception ex) { return $"Could not open {custom.Name}: {ex.Message}"; }
             }
             if (!targets.TryGetValue(target, out var path)) return "I can open Calculator, File Explorer, Task Manager, Downloads, VS Code, or Chrome.";
@@ -852,19 +946,42 @@ internal sealed class ChatForm : Form
     private Panel MakeSettings()
     {
         var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, WrapContents = false, BackColor = Canvas };
+        settingsScroll = panel;
         var cards = new List<SurfaceCard>();
         FlowLayoutPanel Section(string title, int height)
         {
             var card = new SurfaceCard { Height = height, Padding = new Padding(22, 18, 22, 14), Margin = new Padding(4, 4, 4, 12) };
+            if (title == "App shortcuts") shortcutSettingsCard = card;
             var content = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Surface };
             content.Controls.Add(new Label { Text = title, Width = 600, Height = 38, Font = new Font("Segoe UI Semibold", 13), ForeColor = Color.White });
             card.Controls.Add(content); panel.Controls.Add(card); cards.Add(card); return content;
         }
+        var launcherSection = Section("One-touch access", 390);
+        var shortcutSection = Section("App shortcuts", 480);
+        var generalSection = Section("General & voice", 450);
         var aiSection = Section("AI provider", 390);
         var emailSection = Section("Email connections", 260);
-        var generalSection = Section("General & voice", 450);
-        var shortcutSection = Section("App shortcuts", 480);
         var privacySection = Section("Privacy & data", 230);
+        launcherSection.Controls.Add(new Label { Text = "Choose what opens when you click the floating robot or press your TOKI hotkey.", Width = 610, Height = 42, ForeColor = Muted });
+        launcherSection.Controls.Add(new Label { Text = "Floating click opens", AutoSize = true });
+        var primary = new ComboBox { Width = 390, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "Floating click opens" };
+        primary.Items.AddRange(PrimaryViews.Names);
+        primary.SelectedItem = PrimaryViews.Names.Contains(app.Data.PrimaryView) ? app.Data.PrimaryView : "Shortcuts";
+        var primaryStatus = new Label { Text = "Shortcuts opens the compact icon launcher. ☰ opens the full TOKI app.", Width = 610, Height = 38, ForeColor = Muted };
+        primary.SelectedIndexChanged += (_, _) =>
+        {
+            app.Data.PrimaryView = primary.Text; app.Save();
+            primaryStatus.Text = "Saved. The floating robot now opens " + primary.Text + ".";
+        };
+        launcherSection.Controls.Add(primary); launcherSection.Controls.Add(primaryStatus);
+        var floatAnimation = new CheckBox { Text = "Gentle floating animation", Checked = app.Data.FloatAnimation, AutoSize = true };
+        floatAnimation.CheckedChanged += (_, _) => { app.Data.FloatAnimation = floatAnimation.Checked; app.Save(); app.ApplyAppearance(); };
+        launcherSection.Controls.Add(floatAnimation);
+        launcherSection.Controls.Add(new Label { Text = "Robot size (40–192 pixels, applies immediately)", AutoSize = true });
+        var size = new NumericUpDown { Minimum = 40, Maximum = 192, Increment = 4, Value = Math.Clamp(app.Data.OrbSize, 40, 192), Width = 140, AccessibleName = "Floating robot size in pixels" };
+        size.ValueChanged += (_, _) => { app.Data.OrbSize = (int)size.Value; app.Save(); app.ApplyAppearance(); };
+        launcherSection.Controls.Add(size);
+        launcherSection.Controls.Add(SecondaryButton("Preview one-touch view", (_, _) => app.TogglePrimary()));
         panel.Resize += (_, _) =>
         {
             var cardWidth = Math.Min(740, Math.Max(470, panel.ClientSize.Width - 28));
@@ -916,14 +1033,12 @@ internal sealed class ChatForm : Form
         var notifications = new CheckBox { Text = "Notifications and sound", Checked = app.Data.Notifications, AutoSize = true };
         var speak = new CheckBox { Text = "Speak TOKI responses", Checked = app.Data.SpeakResponses, AutoSize = true };
         var speechRate = new NumericUpDown { Minimum = -10, Maximum = 10, Value = Math.Clamp(app.Data.SpeechRate, -10, 10), Width = 100 };
-        var size = new NumericUpDown { Minimum = 40, Maximum = 120, Value = Math.Clamp(app.Data.OrbSize, 40, 120), Width = 100 };
         var hotkey = new ComboBox { Width = 210, DropDownStyle = ComboBoxStyle.DropDownList };
         hotkey.Items.AddRange(new object[] { "Ctrl+Alt+T", "Ctrl+Shift+Space", "Off" });
         hotkey.SelectedItem = app.Data.OpenHotkey;
         if (hotkey.SelectedIndex < 0) hotkey.SelectedIndex = 0;
         generalSection.Controls.Add(startup); generalSection.Controls.Add(top); generalSection.Controls.Add(notifications);
         generalSection.Controls.Add(speak); generalSection.Controls.Add(new Label { Text = "Speech speed", AutoSize = true }); generalSection.Controls.Add(speechRate);
-        generalSection.Controls.Add(new Label { Text = "Floating icon size", AutoSize = true }); generalSection.Controls.Add(size);
         generalSection.Controls.Add(new Label { Text = "Keyboard shortcut to open TOKI", AutoSize = true }); generalSection.Controls.Add(hotkey);
         generalSection.Controls.Add(Button("Save settings", (_, _) =>
         {
@@ -951,11 +1066,11 @@ internal sealed class ChatForm : Form
                 app.Data.StartWithWindows = startup.Checked;
             }
             catch (Exception ex) { MessageBox.Show("Startup setting failed: " + ex.Message); }
-            app.Save(); MessageBox.Show("Saved. Restart TOKI to apply icon size and always-on-top changes.");
+            app.Save(); app.ApplyAppearance(); MessageBox.Show("Settings saved and applied.");
         }));
         privacySection.Controls.Add(SecondaryButton("Delete API key", (_, _) => { app.Data.EncryptedKey = ""; app.Save(); MessageBox.Show("API key deleted."); }));
         privacySection.Controls.Add(SecondaryButton("Clear chat history", (_, _) => { if (MessageBox.Show("Delete local chat history?", "TOKI", MessageBoxButtons.YesNo) == DialogResult.Yes) { app.Data.Messages.Clear(); app.Save(); RefreshChat(); } }));
-        shortcutSection.Controls.Add(new Label { Text = "Choose an .exe or Windows .lnk shortcut, name it, then say 'open <name>' in Chat.", Width = 610, Height = 38, ForeColor = Muted });
+        shortcutSection.Controls.Add(new Label { Text = "Add an .exe or Windows .lnk. Its app icon appears in the floating launcher and Shortcuts page. Hover an icon to see its name.", Width = 610, Height = 48, ForeColor = Muted });
         var shortcuts = new ListBox { Width = 390, Height = 108 };
         void RefreshShortcuts()
         {
@@ -976,14 +1091,17 @@ internal sealed class ChatForm : Form
         shortcutSection.Controls.Add(Button("Add app shortcut", (_, _) =>
         {
             var name = shortcutName.Text.Trim();
-            if (name.Length == 0 || !File.Exists(shortcutPath.Text)) { MessageBox.Show(this, "Enter a name and choose an existing application or shortcut.", "TOKI"); return; }
+            if (name.Length == 0) { MessageBox.Show(this, "Enter a name for this application.", "TOKI"); return; }
+            string validatedPath;
+            try { validatedPath = ShortcutService.ValidatePath(shortcutPath.Text); }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, "TOKI"); return; }
             if (app.Data.AppShortcuts.Any(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) { MessageBox.Show(this, "That shortcut name already exists.", "TOKI"); return; }
-            app.Data.AppShortcuts.Add(new AppShortcut { Name = name, Path = shortcutPath.Text }); app.Save(); RefreshShortcuts(); shortcutName.Clear(); shortcutPath.Clear();
+            app.Data.AppShortcuts.Add(new AppShortcut { Name = name, Path = validatedPath }); app.Save(); RefreshShortcuts(); app.RefreshShortcuts(); shortcutName.Clear(); shortcutPath.Clear();
         }));
         shortcutSection.Controls.Add(SecondaryButton("Remove selected shortcut", (_, _) =>
         {
             if (shortcuts.SelectedIndex < 0) return;
-            app.Data.AppShortcuts.RemoveAt(shortcuts.SelectedIndex); app.Save(); RefreshShortcuts();
+            app.Data.AppShortcuts.RemoveAt(shortcuts.SelectedIndex); app.Save(); RefreshShortcuts(); app.RefreshShortcuts();
         }));
         privacySection.Controls.Add(new Label { Text = "Local data: " + Store.DirectoryPath, Width = 610, Height = 42, ForeColor = Muted });
         return Page("Settings", panel);
@@ -1052,22 +1170,5 @@ internal sealed class SurfaceCard : Panel
 
 internal static class TokiIcon
 {
-    [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
-    public static Icon Create()
-    {
-        using var bitmap = new Bitmap(64, 64);
-        using (var graphics = Graphics.FromImage(bitmap))
-        {
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            graphics.Clear(Color.Transparent);
-            using var fill = new LinearGradientBrush(new Rectangle(0, 0, 64, 64), Color.FromArgb(113, 119, 255), Color.FromArgb(58, 201, 211), 45);
-            graphics.FillEllipse(fill, 3, 3, 58, 58);
-            using var type = new Font("Segoe UI Semibold", 36, FontStyle.Bold, GraphicsUnit.Pixel);
-            TextRenderer.DrawText(graphics, "T", type, new Rectangle(3, 3, 58, 58), Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        }
-        var handle = bitmap.GetHicon();
-        try { return (Icon)Icon.FromHandle(handle).Clone(); }
-        finally { DestroyIcon(handle); }
-    }
+    public static Icon Create() => BrandAssets.CreateIcon();
 }

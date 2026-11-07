@@ -12,22 +12,32 @@ dotnet publish Toki.csproj -c Release --self-contained false -o dist
 
 The published folder must be kept together. TOKI stores settings, encrypted API keys, reminders, and conversations in `%LOCALAPPDATA%\TOKI\data.json`. Keys are protected with Windows DPAPI for the current Windows user. TOKI does not make an AI request until a key is configured and a chat message is sent. Depending on your provider and account, such a request may be billed; TOKI itself does not buy credits or start a subscription.
 
-Run `dist/Toki.exe --open` to open the full workspace immediately. Launching without `--open` starts with the floating icon and tray control.
+Run `dist/Toki.exe --open` to open the full workspace immediately, or `dist/Toki.exe --launcher` to show the compact shortcut launcher. Launching without these switches starts with the floating robot and tray control.
 
 ## Use
 
-- Drag the floating `T` to move it. Click to open chat; right-click for its menu.
+- Drag the floating robot to move it. Click to open your chosen one-touch view (Shortcuts by default); right-click for its menu. The robot preserves its original proportions on a transparent square canvas, with a gentle 3-pixel floating motion that pauses while pointing or dragging. Disable motion in **Settings → One-touch access**; Windows' disabled UI effects are respected too.
+- The rounded shortcut launcher shows app icons. **☰ opens the full TOKI workspace directly**, with Shortcuts, Chat, Reminders, Email, Usage, and Settings. The matching **×** button closes the launcher. Shortcut management is inside the full workspace.
+- **Settings → One-touch access** has a manual robot-size control (40–192 pixels) and a **Gentle floating animation** on/off switch. Both apply and save immediately. New installations start at 96 pixels; existing saved sizes are preserved. The animation uses cached fractional-pixel frames inside a stationary window.
 - Press `Ctrl+Alt+T` to open TOKI from anywhere. Change this to `Ctrl+Shift+Space` or turn it off in Settings. If another app already owns a shortcut, TOKI asks you to choose another.
 - Use the tray icon to open TOKI, create a new chat, open reminders, email, usage, or settings, pause notifications, restart, or exit.
 - Reminders: enter text, date and time, and optional daily or weekly recurrence. Due reminders display a tray notification with a sound. Snooze, mark done, or delete them from the Reminders page.
 - Chat shortcuts: `open calculator`, `open file explorer`, `open task manager`, `open downloads`, `open vs code`, `open chrome`, `take a screenshot`, `read clipboard`, `copy to clipboard <text>`, and `remind me to study at 7 pm`.
 - Settings: choose OpenAI or another OpenAI-compatible HTTPS endpoint, model, API key, startup behavior, notifications, and floating icon size. The key is encrypted locally. The model name must be supported by the configured provider. Chat responses stream when the provider supports OpenAI-compatible chat completion streaming.
-- App shortcuts: in Settings, choose an `.exe` or `.lnk` file and give it a name. Say `open <name>` in Chat to launch it. TOKI never runs a chat-generated terminal command.
+- App shortcuts: use **☰ → Settings → App shortcuts** (or **Add or manage shortcuts** on the full Shortcuts page), then choose an `.exe` or `.lnk` file and give it a name. Saved apps appear as icons in both the compact launcher and the dedicated **Shortcuts** page. Names remain available as tooltips and accessibility labels. You can also say `open <name>` in Chat. TOKI never runs a chat-generated terminal command.
 - Email: connect Gmail or Outlook through browser-based OAuth. The Email tab shows the active account icon and address; use **Active sender** to switch between saved accounts. **+ Gmail account** opens Google's account chooser. TOKI shows sign-in progress and lets you cancel while the browser is open. Wait until the browser displays the TOKI confirmation page before returning to the app. You can read the latest ten inbox messages and send an email after reviewing a confirmation dialog, or open a draft in the default mail application. TOKI stores OAuth tokens encrypted for the current Windows user.
 - Usage: enter your own plan, limit, used count, reset date, and alert thresholds. The percentage is explicitly a manual estimate.
 - Voice: click the microphone button to invoke Windows voice typing in the chat input. Windows manages microphone permission. Spoken responses can be enabled in Settings; speech runs locally through the Windows SAPI voice and its speed can be adjusted.
 
 ## Current scope and limits
+
+Launcher regression checks (local, no API calls or account access):
+
+```powershell
+dotnet run --project tests/Toki.LauncherChecks/Toki.LauncherChecks.csproj -c Release
+```
+
+The transparent robot asset and Windows icon are embedded in the executable; see [asset notes](Assets/README.md).
 
 This build is a working desktop foundation, but it does **not** yet include a built-in speech recognizer or voice selection, native Windows toast notifications, email thread summaries, reply/forward and saved drafts, trusted-recipient auto-send, or a fully styled animation system. Windows voice typing is launched on demand. Chat reminders support a simple time phrase; use the Reminders tab for exact dates and recurrence. The .NET 6 Desktop Runtime is required by the published executable.
 

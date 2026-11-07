@@ -24,3 +24,5 @@ jobs:
       run: dotnet restore
     - name: Publish Windows app
       run: dotnet publish Toki.csproj -c Release --no-restore --self-contained false -o dist
+    - name: Check launcher behavior
+      run: dotnet run --project tests/Toki.LauncherChecks/Toki.LauncherChecks.csproj -c Release

@@ -8,7 +8,8 @@ public sealed class AppData
 {
     public int OrbX { get; set; } = 50;
     public int OrbY { get; set; } = 100;
-    public int OrbSize { get; set; } = 64;
+    public int OrbSize { get; set; } = 96;
+    public bool FloatAnimation { get; set; } = true;
     public bool TopMost { get; set; } = true;
     public bool StartWithWindows { get; set; }
     public bool Notifications { get; set; } = true;
@@ -27,6 +28,7 @@ public sealed class AppData
     public List<EmailAccount> Accounts { get; set; } = new();
     public Guid? ActiveEmailAccountId { get; set; }
     public string OpenHotkey { get; set; } = "Ctrl+Alt+T";
+    public string PrimaryView { get; set; } = "Shortcuts";
     public List<AppShortcut> AppShortcuts { get; set; } = new();
 }
 
