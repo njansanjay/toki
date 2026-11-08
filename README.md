@@ -1,7 +1,13 @@
 # TOKI desktop assistant
 
-floating windows assistant for accessing window shortcut apps in single touch.
+floating windows assistant for 
+1. accessing window shortcut apps in single touch.
+2. Write email and sent
+3. chat with toki
+4. set remainder
+5. knowing your chatgpt limit and how long u can use it.
 
+## NOTE
 this wont permanently make it there when laptop is turned on so use startup app folder to copy the shortcut of exe and paste there,
 Step by step
 1. Win+R
