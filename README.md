@@ -18,4 +18,4 @@ Step by step
 6. click create shortcut
 7. then cut or copy that shortcut and paste it on to the startup folder and boom its ready to use as soon as u open ur laptop or pc 
 
-![ok cat holding a blue orb](Assets/ok-cat.png)
+<p align="left"><img src="Assets/ok-cat.png" alt="ok cat holding a blue orb" width="320"></p>
